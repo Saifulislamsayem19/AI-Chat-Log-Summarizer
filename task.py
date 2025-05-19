@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple
 
 import nltk
 from nltk.corpus import stopwords
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 
 # Load English stopwords from NLTK
 nltk.download('stopwords', quiet=True)
@@ -12,77 +12,95 @@ STOP_WORDS = stopwords.words('english')
 
 def parse_chat_log(file_path: str) -> Dict[str, List[str]]:
     """
-    Parse chat log file to extract messages grouped by speaker (User or AI).
+    Parse a chat log file to extract messages grouped by speaker (User or AI).
     """
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # Regex matches each message block by User or AI until next speaker or EOF
+    # Regex matches each message block by User or AI until the next speaker tag or EOF
     pattern = re.compile(r"(User:|AI:)(.*?)(?=(User:|AI:|$))", re.DOTALL)
     matches = pattern.findall(content)
 
     chat_data = {'User': [], 'AI': []}
 
     for speaker_tag, message, _ in matches:
-        speaker = speaker_tag.rstrip(':')
-        # Clean up whitespace/newlines inside messages
-        cleaned_message = ' '.join(message.strip().split())
-        if cleaned_message:
-            chat_data[speaker].append(cleaned_message)
+        speaker = speaker_tag.rstrip(':')   
+        # Clean up whitespace/newlines inside messages                    
+        cleaned = ' '.join(message.strip().split())            
+        if cleaned:
+            chat_data[speaker].append(cleaned)
 
     return chat_data
 
-def message_statistics(chat_data: Dict[str, List[str]]) -> Dict[str, int]:
+def message_statistics(chat_data: Dict[str, List[str]]) -> Tuple[int, int, int]:
     """
-    Calculate total and per-speaker message counts.
+    Calculate total, user, and AI message counts.
     """
     user_count = len(chat_data.get('User', []))
-    ai_count = len(chat_data.get('AI', []))
-    total_count = user_count + ai_count
+    ai_count   = len(chat_data.get('AI', []))
+    total      = user_count + ai_count
+    return total, user_count, ai_count
 
-    return {
-        'total_messages': total_count,
-        'user_messages': user_count,
-        'ai_messages': ai_count
-    }
-
-def extract_keywords(chat_data: Dict[str, List[str]], top_n: int = 5) -> List[str]:
+def extract_keywords_and_topic(
+    texts: List[str],
+    top_k: int = 5
+) -> Tuple[List[str], str]:
     """
     Extract top N keywords from combined chat messages using TF-IDF.
     """
-    combined_text = ' '.join(chat_data.get('User', []) + chat_data.get('AI', []))
+    if not texts:
+        return [], ''
 
-    vectorizer = TfidfVectorizer(stop_words=STOP_WORDS, max_features=top_n)
-    tfidf_matrix = vectorizer.fit_transform([combined_text])
+    # Combine all messages into one string
+    full_text = ' '.join(texts)
 
-    feature_names = vectorizer.get_feature_names_out()
-    scores = tfidf_matrix.toarray()[0]
+    # TF-IDF vectorizer for top unigrams
+    tfidf = TfidfVectorizer(
+        stop_words=STOP_WORDS,
+        lowercase=True,
+        token_pattern=r'\b[a-zA-Z]{2,}\b',
+        max_features=top_k
+    )
+    tfidf.fit([full_text])
+    keywords = list(tfidf.get_feature_names_out())
 
-    keyword_score_pairs = list(zip(feature_names, scores))
-    # Sort descending by TF-IDF score
-    keyword_score_pairs.sort(key=lambda x: x[1], reverse=True)
+    # CountVectorizer for bigrams to approximate user topic
+    cv = CountVectorizer(
+        stop_words=STOP_WORDS,
+        lowercase=True,
+        ngram_range=(2, 2),
+        token_pattern=r'\b[a-zA-Z]{2,}\b'
+    )
+    # Only use the same combined text to find bigram frequencies
+    bigram_matrix = cv.fit_transform([full_text])
+    bigram_counts = bigram_matrix.toarray()[0]
+    bigram_features = cv.get_feature_names_out()
 
-    return [kw for kw, _ in keyword_score_pairs]
+    if bigram_counts.sum() > 0:
+        # Select the most frequent bigram as the "main topic"
+        main_idx = bigram_counts.argmax()
+        main_topic = bigram_features[main_idx]
+    else:
+        main_topic = keywords[0] if keywords else ''
+
+    return keywords, main_topic
 
 def generate_summary(chat_data: Dict[str, List[str]]) -> str:
     """
     Generate a human-readable summary of the chat log.
     """
-    stats = message_statistics(chat_data)
-    keywords = extract_keywords(chat_data, top_n=5)
+    total, user_messages, ai_messages = message_statistics(chat_data)
+    # Combine both User and AI messages for keyword/topic extraction
+    combined = chat_data.get('User', []) + chat_data.get('AI', [])
+    keywords, topic = extract_keywords_and_topic(combined, top_k=5)
 
-    keyword_str = ', '.join(keywords) if keywords else 'No significant keywords found'
-
+    # Format the summary exactly as requested
     summary_lines = [
         "Summary:",
-        f"- The conversation had {stats['total_messages']} exchanges.",
-        f"- The user sent {stats['user_messages']} messages; the AI sent {stats['ai_messages']} messages.",
-        f"- Most common keywords: {keyword_str}.",
+        f"- The conversation had {total} exchanges.",
+        f"- The user asked mainly about {topic}.",
+        f"- Most common keywords: {', '.join(keywords)}."
     ]
-
-    if keywords:
-        summary_lines.append(f"- The user asked mainly about {keywords[0]} and related topics.")
-
     return '\n'.join(summary_lines)
 
 def summarize_all_chats(folder_path: str) -> str:
@@ -90,23 +108,21 @@ def summarize_all_chats(folder_path: str) -> str:
     Process and summarize all chat log files (.txt) in a folder.
     """
     if not os.path.isdir(folder_path):
-        return f"Error: Provided path '{folder_path}' is not a valid directory."
+        return f"Error: '{folder_path}' is not a valid directory."
 
-    chat_files = sorted(f for f in os.listdir(folder_path) if f.lower().endswith('.txt'))
+    # List and sort only .txt files
+    files = sorted(f for f in os.listdir(folder_path) if f.lower().endswith('.txt'))
+    if not files:
+        return f"No .txt chat log files found in '{folder_path}'."
 
-    if not chat_files:
-        return f"No .txt chat log files found in directory '{folder_path}'."
+    output = []
+    for filename in files:
+        path = os.path.join(folder_path, filename)
+        data = parse_chat_log(path)
+        summary = generate_summary(data)
+        output.append(f"\nSummary for '{filename}':\n{summary}")
 
-    summaries = []
-    for filename in chat_files:
-        full_path = os.path.join(folder_path, filename)
-        chat_data = parse_chat_log(full_path)
-        summary = generate_summary(chat_data)
-        header = f"\nSummary for '{filename}':\n"
-        summaries.append(header)
-        summaries.append(summary)
-
-    return '\n\n'.join(summaries)
+    return '\n'.join(output)
 
 if __name__ == '__main__':
     # folder path -  chat logs folder
